@@ -1,0 +1,117 @@
+#!/bin/bash
+# fncp — fnOS 应用服务配置
+# 以 root 运行 (run-as: root), 负责:
+#   * 安装 fcp 命令到 /usr/local/bin
+#   * 部署 Web 终端 (webui.py + ui/) 到数据目录
+#   * 卸载时清理命令与进程
+
+LOG_FILE="${TRIM_PKGVAR}/${TRIM_APPNAME}.log"
+PID_FILE="${TRIM_PKGVAR}/${TRIM_APPNAME}.pid"
+
+SERVICE_COMMAND="python3 ${TRIM_PKGVAR}/webui.py"
+SVC_BACKGROUND=y
+SVC_WRITE_PID=y
+SVC_CWD="${TRIM_PKGVAR}"
+
+# 定位 app 解包目录 (兼容 app.tgz 解到 TRIM_APPDEST 或 TRIM_APPDEST/app 两种路径)
+app_root() {
+    local cand
+    for cand in "${TRIM_APPDEST}/app" "${TRIM_APPDEST}"; do
+        if [ -f "$cand/fcp" ]; then
+            echo "$cand"
+            return 0
+        fi
+    done
+    echo "${TRIM_APPDEST}/app"
+}
+
+write_home_profile() {
+    local home_dir="$1"
+    mkdir -p "${home_dir}" 2>/dev/null || true
+    cat > "${home_dir}/.bashrc" <<'EOF'
+# fncp web terminal profile
+export TERM=xterm-256color
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+export LS_COLORS='di=01;34:ln=01;36:ex=01;32'
+PS1='\[\033[01;33m\][\t]\[\033[00m\] \[\033[01;31m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+alias ls='ls --color=auto'
+alias ll='ls -lah --color=auto'
+alias la='ls -A --color=auto'
+alias grep='grep --color=auto'
+alias egrep='egrep --color=auto'
+shopt -s checkwinsize
+EOF
+    # 首次进入提示
+    if [ ! -f "${home_dir}/.fncp_welcome" ]; then
+        cat >> "${home_dir}/.bashrc" <<'EOF'
+
+echo
+echo "  =============================================="
+echo "   fncp 终端   (root 权限)"
+echo "  ----------------------------------------------"
+echo "   fcp help       查看复制粘贴用法"
+echo "   fcp copy <路径> + fcp paste <目标>"
+echo "   sudo fcp ...   以 root 权限操作"
+echo "  =============================================="
+echo
+EOF
+        touch "${home_dir}/.fncp_welcome"
+    fi
+}
+
+service_postinst() {
+    local root home_dir
+    root=$(app_root)
+
+    # 1. 安装 CLI 到系统命令路径 (root 权限)
+    if install -m 0755 "${root}/fcp" /usr/local/bin/fcp 2>/dev/null; then
+        install_log "installed /usr/local/bin/fcp"
+    else
+        install_log "WARN: 无法写入 /usr/local/bin, 尝试备用路径"
+        mkdir -p /opt/bin 2>/dev/null || true
+        if install -m 0755 "${root}/fcp" /opt/bin/fcp 2>/dev/null; then
+            install_log "installed /opt/bin/fcp"
+        fi
+    fi
+
+    # 2. 部署 Web 终端
+    mkdir -p "${TRIM_PKGVAR}/ui" "${TRIM_PKGVAR}/home"
+    cp -f "${root}/webui.py" "${TRIM_PKGVAR}/webui.py"
+    chmod 0755 "${TRIM_PKGVAR}/webui.py"
+    cp -a "${root}/ui/." "${TRIM_PKGVAR}/ui/"
+    install_log "deployed web terminal to ${TRIM_PKGVAR}"
+
+    # 3. 终端 home 配置
+    home_dir="${TRIM_PKGVAR}/home"
+    write_home_profile "${home_dir}"
+
+    # 4. 配置 fcp 工具的免密 sudo 依赖 (终端以 root 运行, 此步仅为兼容)
+    if [ -d /etc/sudoers.d ]; then
+        echo "root ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/fncp 2>/dev/null || true
+        chmod 440 /etc/sudoers.d/fncp 2>/dev/null || true
+    fi
+
+    install_log "fncp postinst done"
+}
+
+service_postupgrade() {
+    service_postinst
+}
+
+service_preuninst() {
+    rm -f /etc/sudoers.d/fncp
+    rm -f /usr/local/bin/fcp
+    rm -f /opt/bin/fcp
+    pkill -f "webui.py" 2>/dev/null || true
+    sleep 1
+    pkill -9 -f "webui.py" 2>/dev/null || true
+}
+
+service_poststop() {
+    pkill -f "webui.py" 2>/dev/null || true
+}
+
+service_postconfig() {
+    service_postinst
+}

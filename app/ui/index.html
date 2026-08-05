@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fncp 终端 - 飞牛NAS 文件复制粘贴</title>
+<link rel="stylesheet" href="vendor/xterm.css">
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --fg: #c9d1d9;
+    --muted: #8b949e;
+    --accent: #2f81f7;
+    --green: #3fb950;
+    --red: #f85149;
+    --amber: #d29922;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  header .logo {
+    width: 30px; height: 30px;
+    border-radius: 6px;
+    background: linear-gradient(135deg, var(--accent), #6e40c9);
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 800; font-size: 14px; color: #fff;
+  }
+  header h1 { font-size: 15px; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  header .status { margin-left: auto; display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  header .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .warn {
+    flex-shrink: 0;
+    background: rgba(210, 153, 34, 0.12);
+    border-bottom: 1px solid rgba(210, 153, 34, 0.35);
+    color: var(--amber);
+    font-size: 12px;
+    padding: 6px 16px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  #terminal {
+    flex: 1;
+    min-height: 0;
+    padding: 8px;
+    font-size: 14px;
+  }
+  #terminal .xterm { height: 100%; }
+  #toast {
+    position: fixed;
+    left: 50%; bottom: 24px;
+    transform: translateX(-50%);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--red);
+    padding: 8px 14px;
+    border-radius: 6px;
+    font-size: 13px;
+    display: none;
+    z-index: 10;
+    box-shadow: 0 4px 20px rgba(0,0,0,.5);
+  }
+  footer {
+    flex-shrink: 0;
+    padding: 6px 16px;
+    font-size: 11px;
+    color: var(--muted);
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    display: flex;
+    gap: 16px;
+  }
+  footer b { color: var(--fg); font-weight: 600; }
+  kbd { background: rgba(110,118,129,0.2); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">fc</div>
+  <div>
+    <h1>fncp 终端</h1>
+    <div class="sub">飞牛NAS 文件 / 目录复制粘贴工具</div>
+  </div>
+  <div class="status"><span class="dot"></span>已连接</div>
+</header>
+<div class="warn">已启用 sudo 免密：终端内可直接使用 <b>sudo</b>（当前账户对系统拥有全部权限，请注意安全）。fcp 已安装，输入 <kbd>fcp help</kbd> 查看用法。</div>
+<div id="terminal"></div>
+<footer>
+  <span>fcp 用法：<kbd>fcp copy 路径</kbd> · <kbd>fcp cut 路径</kbd> · <kbd>fcp paste 目标</kbd> · <kbd>fcp show</kbd></span>
+  <span>TAB 命令补全 / 方向键历史 <b>✓</b></span>
+</footer>
+<div id="toast"></div>
+
+<script src="vendor/xterm.js"></script>
+<script src="vendor/addon-fit.js"></script>
+<script src="vendor/addon-web-links.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  // ---------- 二进制工具 ----------
+  function strToB64(s) {
+    return btoa(unescape(encodeURIComponent(s)));
+  }
+  function b64ToBytes(b64) {
+    var bin = atob(b64);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+
+  // ---------- 终端 ----------
+  var term = new Terminal({
+    cursorBlink: true,
+    cursorStyle: "block",
+    fontSize: 14,
+    fontFamily: '"Cascadia Mono", "JetBrains Mono", Consolas, monospace',
+    theme: {
+      background: "#0d1117",
+      foreground: "#c9d1d9",
+      cursor: "#58a6ff",
+      selectionBackground: "rgba(88,166,255,0.3)",
+      black: "#484f58", red: "#ff7b72", green: "#3fb950",
+      yellow: "#d29922", blue: "#58a6ff", magenta: "#bc8cff",
+      cyan: "#39c5cf", white: "#b1bac4",
+      brightBlack: "#6e7681", brightRed: "#ffa198", brightGreen: "#56d364",
+      brightYellow: "#e3b341", brightBlue: "#79c0ff", brightMagenta: "#d2a8ff",
+      brightCyan: "#56d4dd", brightWhite: "#f0f6fc"
+    },
+    scrollback: 5000,
+    allowProposedApi: false
+  });
+
+  var fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  term.loadAddon(new WebLinksAddon.WebLinksAddon());
+  term.open(document.getElementById("terminal"));
+  fitAddon.fit();
+
+  // ---------- 会话 ----------
+  function genToken() {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    return "t-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+  }
+  var token = genToken();
+  var es = null;
+  var keepTrying = true;
+
+  function toast(msg, ms) {
+    var el = document.getElementById("toast");
+    el.textContent = msg;
+    el.style.display = "block";
+    clearTimeout(toast._t);
+    toast._t = setTimeout(function () { el.style.display = "none"; }, ms || 4000);
+  }
+
+  function connect() {
+    if (!keepTrying) return;
+    token = genToken();
+    es = new EventSource("/api/term?token=" + encodeURIComponent(token));
+
+    es.onopen = function () { /* connected */ };
+
+    es.onmessage = function (ev) {
+      if (!ev.data || ev.data === ": keepalive") return;
+      try {
+        term.write(b64ToBytes(ev.data));
+      } catch (e) { /* ignore */ }
+    };
+
+    es.onerror = function () {
+      // 连接断开：销毁旧会话并尝试重连
+      es && es.close();
+      toast("终端连接断开，正在重连…", 2000);
+      setTimeout(connect, 1500);
+    };
+  }
+  connect();
+
+  // ---------- 输入 / 尺寸 ----------
+  function post(path, body) {
+    return fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+  }
+
+  term.onData(function (data) {
+    post("/api/term/input", { token: token, data: strToB64(data) });
+  });
+
+  term.onResize(function (d) {
+    post("/api/term/resize", { token: token, cols: d.cols, rows: d.rows });
+  });
+
+  window.addEventListener("resize", function () {
+    try { fitAddon.fit(); } catch (e) {}
+  });
+
+  // 初始尺寸同步
+  setTimeout(function () {
+    try {
+      var d = fitAddon.proposeDimensions ? fitAddon.proposeDimensions() : null;
+      if (d) post("/api/term/resize", { token: token, cols: d.cols, rows: d.rows });
+    } catch (e) {}
+  }, 300);
+
+  // 页面前/后台切换时重新校准尺寸
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) setTimeout(function () { try { fitAddon.fit(); } catch (e) {} }, 100);
+  });
+})();
+</script>
+</body>
+</html>

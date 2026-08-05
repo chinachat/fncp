@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# ============================================================================
+# fncp  (fcp)  —— 飞牛NAS 命令行文件/目录剪切板复制粘贴工具
+#
+# 特性:
+#   * 剪切板式操作: fcp copy/cut 记住路径, fcp paste 执行粘贴
+#   * 通过 sudo 执行, 可复制任意系统级文件(如 /etc、docker 卷等)
+#   * 以 root 身份执行 rsync -a / cp -a, 完整保留属主/属组/权限/时间戳
+#   * 使用 rsync 进度条 (--info=progress2), 无 rsync 时回退到 cp
+#   * 剪切模式跨文件系统自动退化为"复制+删除"
+#
+# 用法:
+#   fcp copy  <路径>...    复制到剪切板 (复制模式)
+#   fcp cut   <路径>...    剪切到剪切板 (移动模式)
+#   fcp paste [-f] [目标]  粘贴到目标目录 (默认当前目录; -f 覆盖已存在项)
+#   fcp show               显示剪切板内容
+#   fcp rm <序号>          从剪切板移除指定项
+#   fcp clear              清空剪切板
+#   fcp help               显示帮助
+# ============================================================================
+
+set -uo pipefail
+
+PROG="fcp"
+CLIP_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fncp"
+CLIP_FILE="$CLIP_DIR/clipboard"
+
+die() { echo "错误: $*" >&2; exit 1; }
+info() { echo "[fncp] $*"; }
+
+usage() {
+  cat <<EOF
+fncp —— 飞牛NAS 文件/目录剪切板复制粘贴工具
+
+用法:
+  $PROG copy  <路径>...      复制到剪切板 (复制模式)
+  $PROG cut   <路径>...      剪切到剪切板 (移动模式)
+  $PROG paste [-f] [目标]    粘贴到目标目录 (默认当前目录)
+                             -f / --force  目标已存在时直接覆盖
+  $PROG show                显示剪切板内容
+  $PROG rm <序号>           从剪切板移除指定项
+  $PROG clear               清空剪切板
+  $PROG help               显示本帮助
+
+说明:
+  * 粘贴时自动使用 sudo, 可操作任意系统目录, 并保留属主/权限/时间戳
+  * 剪切模式下如源与目标不在同一文件系统, 自动改为"复制后删除源"
+EOF
+}
+
+# ---------- 剪切板读写 ----------
+clipboard_save() {  # clip_save <mode> <path...>
+  local mode="$1"; shift
+  mkdir -p "$CLIP_DIR"
+  {
+    echo "MODE $mode"
+    for p in "$@"; do printf '%s\n' "$p"; done
+  } > "$CLIP_FILE"
+}
+
+clipboard_mode() {
+  if [ -f "$CLIP_FILE" ]; then
+    awk 'NR==1 && $1=="MODE" {print $2}' "$CLIP_FILE"
+  fi
+}
+
+clipboard_paths() {
+  [ -f "$CLIP_FILE" ] && awk 'NR>1 {print}' "$CLIP_FILE"
+}
+
+# ---------- 路径处理 ----------
+abspath() {  # 转为绝对路径 (文件/目录均可)
+  local p="$1"
+  [ -e "$p" ] || die "路径不存在: $p"
+  readlink -f -- "$p"
+}
+
+# ---------- 复制/移动核心 ----------
+same_fs() {  # 判断两路径是否在同一文件系统
+  local a b
+  a=$(stat -c %d "$1" 2>/dev/null) || return 1
+  b=$(stat -c %d "$2" 2>/dev/null) || return 1
+  [ "$a" = "$b" ]
+}
+
+run_copy() {  # sudo rsync/cp, root 身份保留属主与权限
+  local src="$1" dest="$2"
+  if command -v rsync >/dev/null 2>&1; then
+    sudo rsync -a --info=progress2 "$src" "$dest"
+  else
+    info "未检测到 rsync, 回退到 cp -a (无进度条)"
+    sudo cp -a -- "$src" "$dest"
+  fi
+}
+
+paste_one() {
+  local src="$1" target="$2" force="$3"
+  local base dest
+
+  base=$(basename "$src")
+  dest="$target/$base"
+
+  # 防自复制: 目标位于源目录内部
+  case "$target/" in
+    "$src/"*) die "不能将目录 $src 复制到其自身内部" ;;
+  esac
+
+  # 冲突处理
+  if [ -e "$dest" ]; then
+    if [ "$force" != "1" ]; then
+      echo -n "目标已存在: $dest  [y]覆盖 / [n]跳过 / [a]全部覆盖? "
+      read -r ans
+      case "$ans" in
+        a|A) force=1 ;;
+        y|Y) ;;
+        *) echo "跳过: $src"; return ;;
+      esac
+    fi
+  fi
+
+  if [ "$MODE" = "cut" ]; then
+    if same_fs "$src" "$target"; then
+      if sudo mv -- "$src" "$dest"; then
+        info "已移动: $src -> $dest"
+      else
+        die "移动失败: $src"
+      fi
+    else
+      info "跨文件系统移动, 改为复制后删除源: $src"
+      run_copy "$src" "$target" || die "复制失败: $src"
+      sudo rm -rf -- "$src"
+      info "已移动(跨文件系统): $src -> $dest"
+    fi
+  else
+    run_copy "$src" "$target" || die "复制失败: $src"
+    info "已复制: $src -> $dest"
+  fi
+}
+
+# ---------- 子命令 ----------
+cmd_copy() {  # copy | cut <路径...>
+  [ $# -eq 0 ] && die "请指定要操作的路径"
+  local mode="$1"; shift
+  local -a list=()
+  local p seen=""
+  for p in "$@"; do
+    p=$(abspath "$p")
+    case "|$seen|" in
+      *"|$p|"*) echo "跳过重复路径: $p" >&2 ;;
+      *) seen="$seen|$p"; list+=("$p") ;;
+    esac
+  done
+  clipboard_save "$mode" "${list[@]}"
+  info "剪切板已记录 ($mode 模式, ${#list[@]} 项):"
+  for p in "${list[@]}"; do echo "    $p"; done
+}
+
+cmd_paste() {
+  local force=0 target="$PWD"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f|--force) force=1 ;;
+      help|-h) usage; return 0 ;;
+      *) target="$1" ;;
+    esac
+    shift
+  done
+
+  [ -f "$CLIP_FILE" ] || die "剪切板为空, 请先 fcp copy/cut"
+
+  MODE=$(clipboard_mode)
+  [ "$MODE" = "copy" ] || [ "$MODE" = "cut" ] || die "剪切板格式无效"
+
+  if [ ! -d "$target" ]; then
+    die "目标目录不存在: $target"
+  fi
+
+  # 提前缓存 sudo 凭据, 避免中途多次输密码
+  sudo -v
+
+  local count=0
+  local line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    [ -e "$line" ] || { echo "警告: 源路径不存在, 已跳过: $line" >&2; continue; }
+    paste_one "$line" "$target" "$force"
+    count=$((count+1))
+  done < <(clipboard_paths)
+
+  if [ "$MODE" = "cut" ] && [ "$count" -gt 0 ]; then
+    rm -f "$CLIP_FILE"
+    info "剪切模式完成, 剪切板已清空"
+  fi
+}
+
+cmd_show() {
+  if [ ! -f "$CLIP_FILE" ]; then
+    info "剪切板为空"
+    return 0
+  fi
+  local mode
+  mode=$(clipboard_mode)
+  echo "模式: $mode"
+  local n=0 line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    n=$((n+1))
+    printf '%2d) %s\n' "$n" "$line"
+  done < <(clipboard_paths)
+  [ "$n" -eq 0 ] && echo "(无内容)"
+}
+
+cmd_rm() {
+  [ $# -ge 1 ] || die "用法: $PROG rm <序号>"
+  [ -f "$CLIP_FILE" ] || die "剪切板为空"
+  local -a all=()
+  local line
+  while IFS= read -r line; do all+=("$line"); done < <(clipboard_paths)
+
+  local idx
+  for idx in "$@"; do
+    if [ "$idx" -lt 1 ] || [ "$idx" -gt "${#all[@]}" ]; then
+      echo "序号越界: $idx" >&2
+    fi
+  done
+
+  local mode
+  mode=$(clipboard_mode)
+  local -a keep=()
+  local i
+  for i in "${!all[@]}"; do
+    local ok=1
+    for idx in "$@"; do
+      [ "$((i+1))" = "$idx" ] && ok=0
+    done
+    [ "$ok" = "1" ] && keep+=("${all[$i]}")
+  done
+  clipboard_save "$mode" "${keep[@]}"
+  info "已移除, 当前剩余 ${#keep[@]} 项"
+}
+
+cmd_clear() {
+  rm -f "$CLIP_FILE"
+  info "剪切板已清空"
+}
+
+# ---------- 入口 ----------
+main() {
+  [ $# -eq 0 ] && { usage; return 0; }
+  local cmd="$1"; shift
+  case "$cmd" in
+    copy) cmd_copy copy "$@" ;;
+    cut)  cmd_copy cut  "$@" ;;
+    paste) cmd_paste "$@" ;;
+    show)  cmd_show ;;
+    rm)    cmd_rm "$@" ;;
+    clear) cmd_clear ;;
+    help|-h|--help) usage ;;
+    *) echo "未知命令: $cmd" >&2; usage; return 1 ;;
+  esac
+}
+
+main "$@"

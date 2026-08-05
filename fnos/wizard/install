@@ -1,0 +1,11 @@
+[
+    {
+        "stepTitle": "安装说明",
+        "items": [
+            {
+                "type": "tips",
+                "helpText": "fncp 是命令行文件/目录剪切板式复制粘贴工具，内置 Web 终端。\n\n安装完成后：\n1. 桌面出现应用图标，点击打开 Web 终端\n2. 终端以 root 权限运行，可直接复制任意系统文件\n3. 用法：fcp copy <路径> → fcp paste <目标>"
+            }
+        ]
+    }
+]

@@ -1,0 +1,15 @@
+{
+    ".url": {
+        "fncp.Application":
+        {
+            "title": "fncp",
+            "desc": "fncp 命令行文件复制粘贴工具",
+            "icon": "images/{0}.png",
+            "type": "url",
+            "port": "18018",
+            "protocol": "http",
+            "url": "/",
+            "allUsers": true
+        }
+    }
+}
