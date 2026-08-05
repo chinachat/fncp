@@ -47,6 +47,18 @@
   header .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
   header .status { margin-left: auto; display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
   header .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 6px var(--green); }
+  header .actions { display: flex; align-items: center; gap: 8px; }
+  header .actions button {
+    background: rgba(110,118,129,0.15);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 12px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: background .15s, border-color .15s;
+  }
+  header .actions button:hover { background: rgba(47,129,247,0.2); border-color: var(--accent); }
   .warn {
     flex-shrink: 0;
     background: rgba(210, 153, 34, 0.12);
@@ -97,6 +109,10 @@
   <div>
     <h1>fncp 终端</h1>
     <div class="sub">飞牛NAS 文件 / 目录复制粘贴工具</div>
+  </div>
+  <div class="actions">
+    <button id="btn-copy" title="复制选中的终端内容 (Ctrl+Shift+C)">复制</button>
+    <button id="btn-clear" title="清屏 (Ctrl+L)">清屏</button>
   </div>
   <div class="status"><span class="dot"></span>已连接</div>
 </header>
@@ -226,6 +242,72 @@
   // 页面前/后台切换时重新校准尺寸
   document.addEventListener("visibilitychange", function () {
     if (!document.hidden) setTimeout(function () { try { fitAddon.fit(); } catch (e) {} }, 100);
+  });
+
+  // ---------- 选中复制 / 一键清屏 ----------
+  function sendInput(str) {
+    post("/api/term/input", { token: token, data: strToB64(str) });
+  }
+
+  function copyText(text) {
+    if (!text) { toast("没有选中内容，请先拖动鼠标选择文本"); return; }
+    function done() { toast("已复制选中内容"); }
+    function fail() {
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); done(); } catch (e) { toast("复制失败"); }
+      document.body.removeChild(ta);
+    }
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(done, fail);
+    } else {
+      fail();
+    }
+  }
+
+  function copySelection() {
+    var sel = term.getSelection();
+    if (!sel) { toast("没有选中内容，请先拖动鼠标选择文本"); return; }
+    copyText(sel);
+  }
+
+  // 一键清屏: 发送 Ctrl+L
+  function clearScreen() {
+    sendInput("\x0c");
+    toast("已清屏");
+  }
+
+  document.getElementById("btn-copy").addEventListener("click", copySelection);
+  document.getElementById("btn-clear").addEventListener("click", clearScreen);
+
+  // 键盘快捷键: Ctrl+Shift+C 复制 / Ctrl+Shift+V 粘贴 (http 下粘贴需浏览器授权)
+  term.attachCustomKeyEventHandler(function (e) {
+    if (e.type !== "keydown") return true;
+    if (e.ctrlKey && e.shiftKey && (e.key === "C" || e.key === "c")) {
+      copySelection();
+      return false;
+    }
+    if (e.ctrlKey && e.shiftKey && (e.key === "V" || e.key === "v")) {
+      if (navigator.clipboard && navigator.clipboard.readText) {
+        navigator.clipboard.readText().then(function (t) { if (t) sendInput(t); });
+      }
+      return false;
+    }
+    if (e.ctrlKey && (e.key === "l" || e.key === "L")) {
+      // Ctrl+L 由终端内 shell 处理清屏, 此处放行给 shell
+      return true;
+    }
+    return true;
+  });
+
+  // 右键: 有选中则复制并拦截, 否则走浏览器菜单
+  document.getElementById("terminal").addEventListener("contextmenu", function (e) {
+    var sel = term.getSelection();
+    if (sel) { e.preventDefault(); copyText(sel); }
   });
 })();
 </script>
