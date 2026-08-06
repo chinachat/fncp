@@ -101,6 +101,49 @@
   }
   footer b { color: var(--fg); font-weight: 600; }
   kbd { background: rgba(110,118,129,0.2); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; font-size: 11px; }
+
+  /* ---------- 登录 / 设置 浮层 ---------- */
+  .overlay {
+    position: fixed; inset: 0; z-index: 100;
+    background: rgba(13,17,23,.92);
+    display: flex; align-items: center; justify-content: center;
+    backdrop-filter: blur(4px);
+  }
+  .overlay[hidden] { display: none; }
+  .card {
+    width: 380px; max-width: calc(100vw - 40px);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 28px; box-shadow: 0 12px 48px rgba(0,0,0,.6);
+  }
+  .card.wide { width: 520px; max-height: calc(100vh - 60px); overflow-y: auto; }
+  .card .logo {
+    width: 44px; height: 44px; border-radius: 10px;
+    background: linear-gradient(135deg, var(--accent), #6e40c9);
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 800; font-size: 20px; color: #fff;
+    margin-bottom: 14px;
+  }
+  .card h2 { font-size: 17px; margin-bottom: 4px; }
+  .card .sub { color: var(--muted); font-size: 12px; margin-bottom: 14px; line-height: 1.6; }
+  .card label { display: block; font-size: 12px; color: var(--muted); margin: 14px 0 6px; }
+  .card input[type=password], .card input[type=number], .card textarea {
+    width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--fg); padding: 8px 10px; font-size: 13px; outline: none;
+    font-family: inherit;
+  }
+  .card input:focus, .card textarea:focus { border-color: var(--accent); }
+  .card textarea { resize: vertical; font-family: Consolas, monospace, sans-serif; }
+  .card .btn-row { display: flex; gap: 8px; margin-top: 18px; }
+  .card .btn-row button {
+    flex: 1; padding: 9px 0; border-radius: 6px; border: 1px solid var(--border);
+    background: rgba(110,118,129,.15); color: var(--fg); font-size: 13px; cursor: pointer;
+  }
+  .card .btn-row button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .card .btn-row button:hover { filter: brightness(1.15); }
+  .err { color: var(--red); font-size: 12px; min-height: 16px; margin-top: 10px; }
+  .msg { color: var(--amber); font-size: 12px; margin-top: 10px; white-space: pre-wrap; line-height: 1.6; }
+  .chk { display: flex; align-items: center; gap: 6px; color: var(--fg) !important; cursor: pointer; margin-top: 8px !important; }
+  .chk input { width: auto; }
 </style>
 </head>
 <body>
@@ -113,6 +156,8 @@
   <div class="actions">
     <button id="btn-copy" title="复制选中的终端内容 (Ctrl+Shift+C)">复制</button>
     <button id="btn-clear" title="清屏 (Ctrl+L)">清屏</button>
+    <button id="btn-settings" title="安全设置" hidden>⚙ 设置</button>
+    <button id="btn-lock" title="锁定（退出登录）" hidden>🔒 锁定</button>
   </div>
   <div class="status"><span class="dot"></span>已连接</div>
 </header>
@@ -124,12 +169,47 @@
 </footer>
 <div id="toast"></div>
 
+<!-- 登录浮层 -->
+<div id="login-overlay" class="overlay" hidden>
+  <div class="card">
+    <div class="logo">fc</div>
+    <h2>fncp 终端</h2>
+    <div class="sub">已启用访问密码保护，请输入授权密码后进入终端。</div>
+    <input id="login-pwd" type="password" placeholder="授权密码" autocomplete="current-password">
+    <div class="btn-row"><button id="btn-login" class="primary">登 录</button></div>
+    <div id="login-err" class="err"></div>
+  </div>
+</div>
+
+<!-- 安全设置浮层 -->
+<div id="settings-overlay" class="overlay" hidden>
+  <div class="card wide">
+    <h2>安全设置</h2>
+    <div class="sub">配置保存在服务器 config.json，保存后即时生效。留空表示不限制。</div>
+    <label>访问密码 <span style="color:var(--muted)">（留空 = 不修改）</span></label>
+    <input id="set-pwd" type="password" placeholder="新授权密码" autocomplete="new-password">
+    <label class="chk"><input type="checkbox" id="set-clear-pwd"> 清除访问密码（禁用登录保护）</label>
+    <label>信任网段（CIDR，每行一个，如 192.168.0.0/24）</label>
+    <textarea id="set-cidrs" rows="3" placeholder="192.168.0.0/24&#10;10.0.0.0/8"></textarea>
+    <label>信任网址（Host，每行一个，如 nas.local 或 192.168.1.5:18018）</label>
+    <textarea id="set-hosts" rows="3" placeholder="nas.local&#10;192.168.1.5:18018"></textarea>
+    <label>并发会话数上限（1~1000）</label>
+    <input id="set-max" type="number" min="1" max="1000" value="10">
+    <div class="btn-row">
+      <button id="btn-settings-save" class="primary">保 存</button>
+      <button id="btn-settings-close">关 闭</button>
+    </div>
+    <div id="settings-msg" class="msg"></div>
+  </div>
+</div>
+
 <script src="vendor/xterm.js"></script>
 <script src="vendor/addon-fit.js"></script>
 <script src="vendor/addon-web-links.js"></script>
 <script>
 (function () {
   "use strict";
+  var $ = function (id) { return document.getElementById(id); };
 
   // ---------- 二进制工具 ----------
   function strToB64(s) {
@@ -178,6 +258,7 @@
   var token = genToken();
   var es = null;
   var keepTrying = true;
+  var authRequired = false;
 
   function toast(msg, ms) {
     var el = document.getElementById("toast");
@@ -187,12 +268,38 @@
     toast._t = setTimeout(function () { el.style.display = "none"; }, ms || 4000);
   }
 
-  function connect() {
-    if (!keepTrying) return;
+  // ---------- 登录 ----------
+  function showLogin(msg) {
+    keepTrying = false;
+    if (es) { es.close(); es = null; }
+    $("login-overlay").hidden = false;
+    if (msg) $("login-err").textContent = msg;
+    $("login-pwd").focus();
+  }
+
+  function doLogin() {
+    var pwd = $("login-pwd").value;
+    $("login-err").textContent = "";
+    fetch("/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: pwd })
+    }).then(function (r) {
+      return r.json().then(function (j) { return { status: r.status, body: j }; });
+    }).then(function (res) {
+      if (res.status === 200) location.reload();
+      else $("login-err").textContent = res.body.error || "登录失败";
+    }).catch(function () { $("login-err").textContent = "无法连接服务器"; });
+  }
+  $("btn-login").addEventListener("click", doLogin);
+  $("login-pwd").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") doLogin();
+  });
+
+  // ---------- 连接 ----------
+  function openSSE() {
     token = genToken();
     es = new EventSource("/api/term?token=" + encodeURIComponent(token));
-
-    es.onopen = function () { /* connected */ };
 
     es.onmessage = function (ev) {
       if (!ev.data || ev.data === ": keepalive") return;
@@ -202,13 +309,38 @@
     };
 
     es.onerror = function () {
-      // 连接断开：销毁旧会话并尝试重连
       es && es.close();
-      toast("终端连接断开，正在重连…", 2000);
-      setTimeout(connect, 1500);
+      if (!$("login-overlay").hidden) return; // 登录层已显示，停止自动重连
+      // 先确认登录态（登录过期时停止重连并回到登录页）
+      fetch("/api/settings").then(function (r) {
+        if (r.status === 401) { showLogin("登录已过期，请重新登录"); return; }
+        toast("终端连接断开，正在重连…", 2000);
+        setTimeout(connect, 1500);
+      }).catch(function () {
+        toast("终端连接断开，正在重连…", 2000);
+        setTimeout(connect, 1500);
+      });
     };
   }
-  connect();
+
+  function connect() {
+    if (!keepTrying) return;
+    // SSE 无法携带自定义头，登录态走 Cookie；先探测是否已登录
+    fetch("/api/settings").then(function (r) {
+      if (r.status === 401) { showLogin("请输入授权密码"); return; }
+      openSSE();
+    }).catch(function () { showLogin("无法连接服务器"); });
+  }
+
+  // 初始化：读取服务信息，决定是否显示登录层
+  fetch("/api/info").then(function (r) { return r.json(); }).then(function (info) {
+    authRequired = !!info.auth_required;
+    if (authRequired) {
+      $("btn-settings").hidden = false;
+      $("btn-lock").hidden = false;
+    }
+    connect();
+  }).catch(function () { showLogin("无法连接服务器"); });
 
   // ---------- 输入 / 尺寸 ----------
   function post(path, body) {
@@ -308,6 +440,59 @@
   document.getElementById("terminal").addEventListener("contextmenu", function (e) {
     var sel = term.getSelection();
     if (sel) { e.preventDefault(); copyText(sel); }
+  });
+
+  // ---------- 安全设置 ----------
+  function splitLines(v) {
+    return v.split(/[\n,]+/).map(function (s) { return s.trim(); }).filter(Boolean);
+  }
+
+  $("btn-settings").addEventListener("click", function () {
+    fetch("/api/settings").then(function (r) { return r.json(); }).then(function (cfg) {
+      $("set-cidrs").value = (cfg.allowed_cidrs || []).join("\n");
+      $("set-hosts").value = (cfg.trusted_hosts || []).join("\n");
+      $("set-max").value = cfg.max_sessions || 10;
+      $("set-pwd").value = "";
+      $("set-clear-pwd").checked = false;
+      $("settings-msg").textContent = cfg.auth_enabled
+        ? ""
+        : "⚠ 当前未设置访问密码，局域网内任何能访问此端口的人都可以打开终端，建议立即设置。";
+      $("settings-overlay").hidden = false;
+    }).catch(function () { toast("获取设置失败"); });
+  });
+
+  $("btn-settings-close").addEventListener("click", function () {
+    $("settings-overlay").hidden = true;
+  });
+
+  $("btn-settings-save").addEventListener("click", function () {
+    var body = {
+      allowed_cidrs: splitLines($("set-cidrs").value),
+      trusted_hosts: splitLines($("set-hosts").value),
+      max_sessions: parseInt($("set-max").value, 10) || 10
+    };
+    var pwd = $("set-pwd").value;
+    if ($("set-clear-pwd").checked) body.auth_password = "";
+    else if (pwd) body.auth_password = pwd;
+    fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      return r.json().then(function (j) { return { status: r.status, body: j }; });
+    }).then(function (res) {
+      if (res.status === 200) {
+        toast("设置已保存");
+        setTimeout(function () { location.reload(); }, 600);
+      } else {
+        $("settings-msg").textContent = "保存失败: " + (res.body.error || res.status);
+      }
+    }).catch(function () { $("settings-msg").textContent = "保存失败: 无法连接服务器"; });
+  });
+
+  // 锁定（退出登录）
+  $("btn-lock").addEventListener("click", function () {
+    fetch("/api/logout", { method: "POST" }).then(function () { location.reload(); });
   });
 })();
 </script>

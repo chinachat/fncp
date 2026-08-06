@@ -1,3 +1,10 @@
 # 构建产物/临时文件
 .build/
 *.log
+__pycache__/
+*.pyc
+
+# 运行时配置（含密码哈希等敏感信息，不入库）
+config.json
+app/config.json
+tests/test-config.json
