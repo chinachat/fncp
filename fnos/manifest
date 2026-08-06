@@ -1,5 +1,5 @@
 appname         = fncp
-version         = 1.1.0
+version         = 1.1.1
 display_name    = fncp
 platform        = x86
 maintainer      = chinachat
@@ -14,4 +14,4 @@ disable_authorization_path = true
 desc            = 命令行文件/目录剪切板式复制粘贴工具 + Web 终端。支持 sudo 复制系统级文件并保留权限，终端内 sudo 免密。
 source          = thirdparty
 checksum        =
-fpk_version     = 1.1.0
+fpk_version     = 1.1.1

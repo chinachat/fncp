@@ -6,6 +6,12 @@ fncp webui.py 安全功能集成测试（Windows 可运行）。
 策略：stub 掉 Unix-only 模块 (pty/fcntl/termios)，用假 TermSession 模拟 PTY，
 起真实 ThreadingHTTPServer 做端到端 HTTP 断言。
 
+覆盖（v1.1.1）：
+  * 强制初始化：未设置密码时终端请求一律 401，设置密码即自动登录
+  * 授权密码登录（PBKDF2 存储、HttpOnly Cookie、失败限速锁定）
+  * 信任网段 (CIDR) / 信任网址 (Host) 白名单
+  * 并发会话上限 / 配置热重载 / 登出
+
 运行: python tests/test_webui.py
 """
 import os
@@ -37,6 +43,8 @@ os.environ["FNCP_CONFIG"] = TEST_CONFIG
 os.environ["FNCP_PORT"] = "18099"
 
 import webui  # noqa: E402
+
+webui.LOGIN_LOCK_SECS = 2  # 测试用短锁定时长
 
 # 假 PTY 会话：首次 read 返回问候语，之后按 hang 决定挂住(keepalive)或结束(None)
 class FakeTermSession:
@@ -100,32 +108,35 @@ def main():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     time.sleep(0.3)
 
-    print("== 1. 默认配置（未启用密码） ==")
+    print("== 1. 默认配置（未初始化：强制要求先设置密码） ==")
     s, b, h = req("GET", "/api/info")
     j = json.loads(b)
-    check("info 200, auth_required=False, version=1.1.0",
-          s == 200 and j.get("auth_required") is False and j.get("version") == "1.1.0", b)
+    check("info 200, auth_required=False, version=1.1.1",
+          s == 200 and j.get("auth_required") is False and j.get("version") == "1.1.1", b)
     s, b, h = req("GET", "/api/settings")
-    check("settings 未启用密码时可访问（首次设置入口）", s == 200, b)
-    s, b, h = req("POST", "/api/login", {"password": "x"})
-    check("未启用密码时 login 返回 400", s == 400, b)
+    check("settings 未初始化时可访问（首次设置入口）", s == 200, b)
     s, b, h = req("GET", "/api/term?token=anon0")
-    check("未启用密码时终端可直接用（向后兼容）", s == 200, b[:40])
-    check("会话已清理", len(webui.SESSIONS) == 0, str(webui.SESSIONS))
+    check("未初始化时终端被拒绝 -> 401", s == 401, b)
+    s, b, h = req("POST", "/api/term/input", {"token": "anon0", "data": ""})
+    check("未初始化时 input 被拒绝 -> 401", s == 401, b)
+    s, b, h = req("POST", "/api/login", {"password": "x"})
+    check("未初始化时 login 返回 400", s == 400, b)
 
-    print("== 2. 设置密码 + 白名单 + 并发上限 ==")
+    print("== 2. 初始化：设置密码（自动登录） + 白名单 + 并发上限 ==")
     s, b, h = req("POST", "/api/settings", {
         "auth_password": "test123",
         "allowed_cidrs": ["127.0.0.0/8"],
         "trusted_hosts": ["localhost:18099", "127.0.0.1:18099"],
         "max_sessions": 2,
     })
-    check("设置全部防护项成功", s == 200, b)
+    check("初始化成功且下发登录 Cookie（自动登录）", s == 200 and "Set-Cookie" in h, str(h.get("Set-Cookie")))
+    cookie = h["Set-Cookie"].split(";")[0]
+    check("Cookie 为 HttpOnly 登录态", cookie.startswith("fncp_auth="), cookie)
     check("config.json 已落盘", os.path.exists(TEST_CONFIG))
     raw = open(TEST_CONFIG, encoding="utf-8").read()
     check("密码以哈希存储（非明文）", "test123" not in raw and "pbkdf2_sha256" in raw, raw[:200])
 
-    print("== 3. 启用后鉴权 ==")
+    print("== 3. 初始化后的鉴权 ==")
     s, b, h = req("GET", "/api/settings")
     check("未登录访问 settings -> 401", s == 401, b)
     s, b, h = req("GET", "/api/term?token=anon1")
@@ -146,8 +157,6 @@ def main():
     check("错误密码 -> 401", s == 401, b)
     s, b, h = req("POST", "/api/login", {"password": "test123"})
     check("正确密码 -> 200 + Set-Cookie", s == 200 and "Set-Cookie" in h, str(h.get("Set-Cookie")))
-    cookie = h["Set-Cookie"].split(";")[0]
-    check("Cookie 为 HttpOnly 登录态", cookie.startswith("fncp_auth="), cookie)
 
     print("== 6. 登录后终端全流程 ==")
     s, b, h = req("GET", "/api/term?token=t1", cookie=cookie)
@@ -200,17 +209,32 @@ def main():
     check("同一 token 重连不新建会话", len(webui.SESSIONS) == 2, str(webui.SESSIONS))
     FakeTermSession.hang = False
 
-    print("== 10. 登出与清除密码 ==")
+    print("== 10. 登出 / 登录限速 / 清除密码 ==")
     s, b, h = req("POST", "/api/logout", cookie=cookie)
     check("logout -> 200 + 清除 Cookie", s == 200 and "Max-Age=0" in h.get("Set-Cookie", ""), b)
     s, b, h = req("GET", "/api/settings", cookie=cookie)
     check("登出后 token 失效 -> 401", s == 401, b)
+
+    # 登录限速：清空计数后连续 5 次错误，第 6 次应被锁定 429
+    webui.LOGIN_FAILS.clear()
+    codes = []
+    for i in range(5):
+        s, b, h = req("POST", "/api/login", {"password": "bad%d" % i})
+        codes.append(s)
+    s, b, h = req("POST", "/api/login", {"password": "bad6"})
+    codes.append(s)
+    check("连续错误 5 次后锁定 -> 前5次401, 第6次429", codes == [401] * 5 + [429], str(codes))
     s, b, h = req("POST", "/api/login", {"password": "test123"})
+    check("锁定期内正确密码也拒绝 -> 429", s == 429, b)
+    time.sleep(webui.LOGIN_LOCK_SECS + 0.5)
+    s, b, h = req("POST", "/api/login", {"password": "test123"})
+    check("解锁后正确密码 -> 200", s == 200, b)
     cookie2 = h["Set-Cookie"].split(";")[0]
+
     s, b, h = req("POST", "/api/settings", {"auth_password": ""}, cookie=cookie2)
     check("清除密码成功", s == 200, b)
     s, b, h = req("GET", "/api/term?token=anon2")
-    check("清除密码后终端可匿名访问（恢复默认）", s == 200, b[:40])
+    check("清除密码后回到未初始化状态，终端拒绝 -> 401", s == 401, b)
 
     srv.shutdown()
     if os.path.exists(TEST_CONFIG):

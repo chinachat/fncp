@@ -42,13 +42,17 @@ PORT = int(os.environ.get("FNCP_PORT", "18018"))
 HOST = os.environ.get("FNCP_HOST", "0.0.0.0")
 SHELL = os.environ.get("FNCP_SHELL", "/bin/bash")
 CONFIG_FILE = os.environ.get("FNCP_CONFIG", os.path.join(BASE_DIR, "config.json"))
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 
 AUTH_COOKIE = "fncp_auth"
 AUTH_TOKEN_TTL = 86400  # 登录态有效期: 24 小时
 
+LOGIN_MAX_FAILS = 5     # 同一 IP 连续密码错误次数阈值
+LOGIN_LOCK_SECS = 60    # 触发阈值后的锁定秒数
+
 SESSIONS = {}          # 终端会话: token -> TermSession
 LOGIN_TOKENS = {}      # 登录态: token -> 过期时间戳
+LOGIN_FAILS = {}       # 登录失败计数: ip -> [count, lock_until]
 SESS_LOCK = threading.RLock()
 CONFIG_LOCK = threading.RLock()
 
@@ -233,6 +237,37 @@ def revoke_login(cookie_header):
         pass
 
 
+# ---------- 登录失败限速 ----------
+def login_rate_allowed(ip):
+    """返回 (是否允许尝试, 剩余锁定秒数)。"""
+    now = time.time()
+    with SESS_LOCK:
+        rec = LOGIN_FAILS.get(ip)
+        if not rec:
+            return True, 0
+        count, lock_until = rec
+        if lock_until and now < lock_until:
+            return False, int(lock_until - now) + 1
+        if lock_until and now >= lock_until:
+            rec[0], rec[1] = 0, 0
+        return True, 0
+
+
+def login_fail(ip):
+    with SESS_LOCK:
+        rec = LOGIN_FAILS.get(ip, [0, 0])
+        rec[0] += 1
+        if rec[0] >= LOGIN_MAX_FAILS:
+            rec[1] = time.time() + LOGIN_LOCK_SECS
+            rec[0] = 0
+        LOGIN_FAILS[ip] = rec
+
+
+def login_ok(ip):
+    with SESS_LOCK:
+        LOGIN_FAILS.pop(ip, None)
+
+
 class TermSession:
     """一次 PTY bash 会话。"""
 
@@ -380,9 +415,19 @@ class TermHandler(SimpleHTTPRequestHandler):
             return False
         return True
 
-    def _require_auth(self):
-        """已启用密码时校验登录态，未登录返回 401。"""
+    def _require_settings_auth(self):
+        """设置接口：未启用密码时开放（首次初始化入口）；启用后需登录。"""
         if config.auth_enabled and not check_login(self.headers.get("Cookie")):
+            self._json({"error": "未登录或登录已过期"}, 401)
+            return False
+        return True
+
+    def _require_term_auth(self):
+        """终端接口：必须已完成初始化（设置密码）且已登录，否则一律 401。"""
+        if not config.auth_enabled:
+            self._json({"error": "尚未初始化安全设置，请先设置访问密码"}, 401)
+            return False
+        if not check_login(self.headers.get("Cookie")):
             self._json({"error": "未登录或登录已过期"}, 401)
             return False
         return True
@@ -437,7 +482,7 @@ class TermHandler(SimpleHTTPRequestHandler):
             })
             return
         if path == "/api/term":
-            if not self._require_auth():
+            if not self._require_term_auth():
                 return
             qs = urllib.parse.parse_qs(parsed.query)
             token = (qs.get("token") or [""])[0]
@@ -447,7 +492,7 @@ class TermHandler(SimpleHTTPRequestHandler):
             self._stream_term(token)
             return
         if path == "/api/settings":
-            if not self._require_auth():
+            if not self._require_settings_auth():
                 return
             self._json(config.public())
             return
@@ -505,9 +550,16 @@ class TermHandler(SimpleHTTPRequestHandler):
             if not config.auth_enabled:
                 self._json({"error": "未启用访问密码"}, 400)
                 return
+            ip = self._client_ip()
+            allowed, wait = login_rate_allowed(ip)
+            if not allowed:
+                self._json({"error": "尝试次数过多，请 %d 秒后再试" % wait}, 429)
+                return
             if not config.check_password(pwd):
+                login_fail(ip)
                 self._json({"error": "密码错误"}, 401)
                 return
+            login_ok(ip)
             tok = issue_login_token()
             self._json_cookie({"ok": True},
                               "%s=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d"
@@ -519,17 +571,25 @@ class TermHandler(SimpleHTTPRequestHandler):
                               "%s=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" % AUTH_COOKIE)
             return
         if path == "/api/settings":
-            if not self._require_auth():
+            if not self._require_settings_auth():
                 return
             body = self._read_json()
             try:
+                was_enabled = config.auth_enabled
                 new_cfg = config.update(**body)
+                if not was_enabled and new_cfg["auth_enabled"]:
+                    # 首次初始化：设置密码成功即签发登录态，一步进入终端
+                    tok = issue_login_token()
+                    self._json_cookie({"ok": True, "config": new_cfg},
+                                      "%s=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d"
+                                      % (AUTH_COOKIE, tok, AUTH_TOKEN_TTL))
+                    return
                 self._json({"ok": True, "config": new_cfg})
             except (ValueError, TypeError) as e:
                 self._json({"error": str(e)}, 400)
             return
         if path == "/api/term/input":
-            if not self._require_auth():
+            if not self._require_term_auth():
                 return
             body = self._read_json()
             token = body.get("token", "")
@@ -547,7 +607,7 @@ class TermHandler(SimpleHTTPRequestHandler):
             self._json({"ok": True})
             return
         if path == "/api/term/resize":
-            if not self._require_auth():
+            if not self._require_term_auth():
                 return
             body = self._read_json()
             token = body.get("token", "")

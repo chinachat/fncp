@@ -181,6 +181,21 @@
   </div>
 </div>
 
+<!-- 首次使用初始化浮层（未设置访问密码时必须先设置） -->
+<div id="init-overlay" class="overlay" hidden>
+  <div class="card">
+    <div class="logo">fc</div>
+    <h2>首次使用安全设置</h2>
+    <div class="sub">终端以 root 权限运行，访问前必须设置授权密码（PBKDF2 加密存储）。设置完成后自动进入终端。</div>
+    <label>访问密码</label>
+    <input id="init-pwd" type="password" placeholder="设置授权密码" autocomplete="new-password">
+    <label>确认密码</label>
+    <input id="init-pwd2" type="password" placeholder="再次输入密码" autocomplete="new-password">
+    <div class="btn-row"><button id="btn-init" class="primary">设 置 并 进 入</button></div>
+    <div id="init-err" class="err"></div>
+  </div>
+</div>
+
 <!-- 安全设置浮层 -->
 <div id="settings-overlay" class="overlay" hidden>
   <div class="card wide">
@@ -296,6 +311,38 @@
     if (e.key === "Enter") doLogin();
   });
 
+  // ---------- 首次初始化（强制设置访问密码） ----------
+  function showInit(msg) {
+    keepTrying = false;
+    if (es) { es.close(); es = null; }
+    $("init-overlay").hidden = false;
+    if (msg) $("init-err").textContent = msg;
+    $("init-pwd").focus();
+  }
+
+  function doInit() {
+    var pwd = $("init-pwd").value;
+    var pwd2 = $("init-pwd2").value;
+    $("init-err").textContent = "";
+    if (!pwd) { $("init-err").textContent = "请输入访问密码"; return; }
+    if (pwd.length < 4) { $("init-err").textContent = "密码至少 4 位"; return; }
+    if (pwd !== pwd2) { $("init-err").textContent = "两次输入的密码不一致"; return; }
+    fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ auth_password: pwd })
+    }).then(function (r) {
+      return r.json().then(function (j) { return { status: r.status, body: j }; });
+    }).then(function (res) {
+      if (res.status === 200) location.reload(); // 服务端已下发登录 Cookie，刷新后直接进入终端
+      else $("init-err").textContent = res.body.error || "保存失败";
+    }).catch(function () { $("init-err").textContent = "无法连接服务器"; });
+  }
+  $("btn-init").addEventListener("click", doInit);
+  $("init-pwd2").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") doInit();
+  });
+
   // ---------- 连接 ----------
   function openSSE() {
     token = genToken();
@@ -310,12 +357,18 @@
 
     es.onerror = function () {
       es && es.close();
-      if (!$("login-overlay").hidden) return; // 登录层已显示，停止自动重连
-      // 先确认登录态（登录过期时停止重连并回到登录页）
-      fetch("/api/settings").then(function (r) {
-        if (r.status === 401) { showLogin("登录已过期，请重新登录"); return; }
-        toast("终端连接断开，正在重连…", 2000);
-        setTimeout(connect, 1500);
+      if (!$("login-overlay").hidden || !$("init-overlay").hidden) return; // 已有浮层，停止自动重连
+      // 先确认初始化与登录态（未初始化/登录过期时停止重连并回到对应页面）
+      fetch("/api/info").then(function (r) { return r.json(); }).then(function (info) {
+        if (!info.auth_required) { showInit(); return; }
+        fetch("/api/settings").then(function (r) {
+          if (r.status === 401) { showLogin("登录已过期，请重新登录"); return; }
+          toast("终端连接断开，正在重连…", 2000);
+          setTimeout(connect, 1500);
+        }).catch(function () {
+          toast("终端连接断开，正在重连…", 2000);
+          setTimeout(connect, 1500);
+        });
       }).catch(function () {
         toast("终端连接断开，正在重连…", 2000);
         setTimeout(connect, 1500);
@@ -325,6 +378,7 @@
 
   function connect() {
     if (!keepTrying) return;
+    if (!authRequired) { showInit(); return; } // 未初始化：强制先设置访问密码
     // SSE 无法携带自定义头，登录态走 Cookie；先探测是否已登录
     fetch("/api/settings").then(function (r) {
       if (r.status === 401) { showLogin("请输入授权密码"); return; }
