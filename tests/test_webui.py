@@ -103,8 +103,8 @@ def main():
     print("== 1. 默认配置（未启用密码） ==")
     s, b, h = req("GET", "/api/info")
     j = json.loads(b)
-    check("info 200, auth_required=False, version=1.0.1",
-          s == 200 and j.get("auth_required") is False and j.get("version") == "1.0.1", b)
+    check("info 200, auth_required=False, version=1.1.0",
+          s == 200 and j.get("auth_required") is False and j.get("version") == "1.1.0", b)
     s, b, h = req("GET", "/api/settings")
     check("settings 未启用密码时可访问（首次设置入口）", s == 200, b)
     s, b, h = req("POST", "/api/login", {"password": "x"})
